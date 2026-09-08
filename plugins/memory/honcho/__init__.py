@@ -592,7 +592,32 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         parts = [p for p in parts if p and p.strip()]
         if not parts:
             return self._log_injection("fetched-but-empty")
-        return self._log_injection("injected", self._truncate_to_budget("\n\n".join(parts)))
+        result = self._truncate_to_budget("\n\n".join(parts))
+        # 【本地 PATCH — 入口过滤（2026-09-08，结论库治理双件套①）】
+        # 对注入块中的 Explicit Observations 做入口过滤：过期正则黑名单
+        # （honcho-inject-filter.json，用户可编辑）+ 近重复折叠（保留最新）
+        # + 条数上限（最新 N 条，其余折叠留查询指引）。纯机械、静默降级。
+        if result:
+            try:
+                from plugins.memory.honcho.inject_filter import filter_injection_block
+
+                result = filter_injection_block(result)
+            except Exception:
+                pass
+        # 【本地 PATCH — RRF 融合层（2026-09-03 起，2026-09-06 移植）】
+        # 多源证据账本：RRF 融合基线上下文与 wiki/会话检索结果，追加在
+        # 预算截断之后（账本不占 context_tokens 预算）。任何异常静默降级
+        # 为原结果，不影响主链路。
+        if result and query.strip():
+            try:
+                from plugins.memory.honcho.rrf_fuser import rrf_fuse_prefetch
+
+                fused = rrf_fuse_prefetch(query, result)
+                if fused:
+                    result = result + "\n\n" + fused
+            except Exception:
+                pass
+        return self._log_injection("injected", result)
 
     def _pop_auth_notice(self) -> str:
         """One-time model-facing notice that Honcho auth expired and memory is paused."""

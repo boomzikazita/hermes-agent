@@ -323,12 +323,24 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
     if sys.platform == "win32":
         return []
     holders: List[Tuple[int, str]] = []
+    # 【本地 PATCH】self-skip (env HERMES_WAL_GUARD_SKIP_SELF=1): 本进程被 halt 的连接按上游
+    # 设计 retire-unclosed（Python<3.12 无 setconfig，close 会把退休帧 checkpoint 到新世代），
+    # 这些 fd 是死句柄、永不再读写；而 refuse 路径把 self 计入 holders 会让进程在首次 halt
+    # 后永久自我封锁（2026-09-13 生产实测：FATAL 每 5-10 分钟复发，重启只清零重攒）。
+    # mint 新 WAL 的是全新连接，与死句柄不存在双 WAL 冲突；若本进程仍有活跃旧连接持有
+    # 已删 sidecar，其写入会在 halt 路径被 _wal_generation_was_lost 捕获，不会越权落库。
+    _skip_self = os.environ.get("HERMES_WAL_GUARD_SKIP_SELF") == "1"
+    _self_pid = os.getpid()
     try:
         if sys.platform == "darwin":
             holders = _iter_darwin_sidecar_holders(db_path)
+            if _skip_self:
+                holders = [(pid, target) for pid, target in holders if pid != _self_pid]
         elif sys.platform.startswith("linux"):
             watched = _watched_sqlite_sidecar_paths(db_path)
             for pid, target, fd_path in _iter_proc_fd_targets():
+                if _skip_self and pid == _self_pid:
+                    continue
                 canonical = canonical_sqlite_path(target)
                 if (" (deleted)" in target and canonical in watched
                         and _fd_is_truly_unlinked(fd_path, watched[canonical])):

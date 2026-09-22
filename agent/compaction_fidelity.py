@@ -211,19 +211,23 @@ def _write_log(record: Dict[str, Any]) -> None:
 
 def _judge_important(key: str, missing: Sequence[str], context_hint: str) -> Tuple[List[str], str]:
     hint = _tidy(context_hint)[:200] or "(无)"
+    # 索引化清单:模型只回编号(几个 token),不再逐字回 echo 长签名(生成量超时病根)。
+    numbered = "\n".join(f"[{index}] {fact}" for index, fact in enumerate(missing))
     prompt = (
         f"任务上下文: {hint}\n"
-        "以下硬事实签名抽自被压缩的原文,但未出现在压缩摘要里。判断哪些会影响后续任务继续执行:"
+        "以下硬事实在压缩摘要中缺失。请判断哪些对后续任务仍然重要:"
         "文件路径、IP:端口、版本号、命令行、session/进程 ID、关键配置键值通常重要;"
         "泛化的年份、普通日期、与任务无关的编号通常不重要。\n"
-        '只返回 JSON {"important": [...]},必须是清单的严格子集,签名字符串原样返回,不得改写。\n'
-        "清单:\n" + json.dumps(list(missing), ensure_ascii=False)
+        f"{numbered}\n"
+        '只返回 JSON：{"important": [编号, ...]}（重要项的编号数组，无重要项返回 []）'
     )
     payload = {
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "max_tokens": 1000,
+        # 关思考链:thinking 耗时随清单长度增长(50 条即 >24s),裁决只需直答,开着必超 30s 读超时。
+        "enable_thinking": False,
     }
     request = urllib.request.Request(
         ENDPOINT,
@@ -242,6 +246,15 @@ def _judge_important(key: str, missing: Sequence[str], context_hint: str) -> Tup
                 judged = parsed["important"]
         except (ValueError, AttributeError):
             judged = []
+    if any(isinstance(item, int) and not isinstance(item, bool) for item in judged):
+        # 索引路径:合法 int 编号回映射原串,越界/非 int 一律丢弃(防幻觉)。
+        valid = {
+            item
+            for item in judged
+            if isinstance(item, int) and not isinstance(item, bool) and 0 <= item < len(missing)
+        }
+        return [fact for index, fact in enumerate(missing) if index in valid], raw
+    # 兼容回退:模型回 echo 字符串数组(旧格式)时走原字符串子集匹配。
     picked = {str(item) for item in judged}
     return [fact for fact in missing if fact in picked], raw
 

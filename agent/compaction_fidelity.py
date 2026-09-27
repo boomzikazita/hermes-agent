@@ -9,8 +9,13 @@
    ALIBABA_TOKEN_PLAN_API_KEY,模式同 scripts/ocr_image.py)裁决"是否影响后续任务";
 3. ``augment_summary`` — 重要缺失以原文摘录回灌摘要尾部。
 
-fail-open:无缺失不调模型;裁决失败/超时 → important=missing 全量(宁回灌不误删);
-无 API key → 空转(important=[])。留痕 logs/compaction_fidelity.log(jsonl)。
+fail-open:无缺失不调模型;裁决失败/超时 → important=missing(宁回灌不误删,回灌
+上限 MAX_AUGMENT 条,超出丢弃并记 augment_truncated);无 API key → 空转(important=[])。
+留痕 logs/compaction_fidelity.log(jsonl,含 verdict_raw 供裁决失败归因)。
+
+抽取噪声治理(2026-09-23 三次真实压缩实证):URL 按端点白名单抽取(本机/内网 +
+已在用的 API 域名,文档页/图片/OSS 签名链接不抽);IP 校验段 ≤255 与端口合法性;
+无时间分量的纯日期不抽;被过滤的候选整段占位抹除,不泄给后续抽取器。
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ import json
 import os
 import re
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -29,9 +35,12 @@ TIMEOUT = 30
 MAX_FACTS = 120
 MAX_FACT_LEN = 240
 MAX_JUDGED = 80
+# 回灌预算:fail-open 全量回灌不设上限曾把 105 条原文摘录灌进摘要尾部(09-23 日志实证)。
+MAX_AUGMENT = 10
 
 _SEG = r"[A-Za-z0-9._~+@-]+"
-_RE_URL = re.compile(r"https?://[^\s<>\"'`（），。；：、”“‘’\]\}】」』]+")
+# 字符白名单:旧版排除表漏掉 `\()[]{}*` 等,markdown 残留/字面 \n/中文尾巴整段被吸进 URL。
+_RE_URL = re.compile(r"https?://[A-Za-z0-9\-._~:/?#@!$&+=%]+")
 _RE_IP = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b")
 _RE_DATE = re.compile(
     r"\b\d{4}-\d{1,2}-\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d{1,6})?(?:Z|[+-]\d{2}:?\d{2})?)?"
@@ -61,9 +70,59 @@ _RE_PATH = re.compile(
 )
 _RE_KV = re.compile(
     r"(?<![\w./-])[A-Za-z_][\w.-]{1,40}[ \t]*[:=][ \t]*"
-    r"(?:\"[^\"\n]{1,120}\"|'[^'\n]{1,120}'|[^\s,;，。；'\"\)\]\}]{1,120})"
+    # 值排除反斜杠:URL 收紧后残留的字面 \n 碎片(如 \nproviders:)不再被当键值对抽出。
+    r"(?:\"[^\"\n]{1,120}\"|'[^'\n]{1,120}'|[^\s\\,;，。；'\"\)\]\}]{1,120})"
 )
 _RE_NUMID = re.compile(r"\b\d{4,}\b")
+
+# URL 端点白名单(按 hostname 判断):本机/内网地址 + 已在用的 API 端点域名保留;
+# 文档页、图片、网页链接不抽(09-23 实证:100+ 条 help.aliyun.com/img.alicdn.com/
+# platform.qianwenai.com 等网页 URL 挤爆裁决清单)。宁可白名单外漏抽,不误杀本机端点。
+_URL_API_HOSTS = frozenset({
+    "api.kimi.com",
+    "api.github.com",
+    "api.deepseek.com",
+    "api.z.ai",
+    "api.tikhub.io",
+})
+# *.aliyuncs.com 只保留 API 形态路径(dashscope/token-plan 的 compatible-mode、/api/、/vN)。
+_RE_API_PATH = re.compile(r"^/(?:compatible-mode|api(?:/|$)|v\d)")
+
+
+def _is_internal_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    parts = host.split(".")
+    if len(parts) != 4 or not all(part.isdigit() for part in parts):
+        return False
+    first, second = int(parts[0]), int(parts[1])
+    return first in (10, 127) or (first == 192 and second == 168) or (first == 172 and 16 <= second <= 31)
+
+
+def _port_ok(port: Optional[int]) -> bool:
+    # 端口合法性 1-65535;单位数端口(:1-:9)在会话文本里几乎从不是真实端点,
+    # 是文档碎片/误匹配高发区(09-23 实证 10.0.0.1:1 被当签名回灌),判为碎片。
+    return port is None or 10 <= port <= 65535
+
+
+def _keep_url(url: str) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if _is_internal_host(host):
+        return _port_ok(port)
+    # OSS 桶主机名带 .oss- 段,签名链接(Expires/Signature 参数)一次性有效,无回灌价值。
+    if ".oss-" in host or host.startswith("oss-"):
+        return False
+    if host == "aliyuncs.com" or host.endswith(".aliyuncs.com"):
+        path = parts.path or "/"
+        return path == "/" or bool(_RE_API_PATH.match(path))
+    return host in _URL_API_HOSTS
 
 
 def _tidy(value: str) -> str:
@@ -71,7 +130,22 @@ def _tidy(value: str) -> str:
 
 
 def _clean_url(raw: str) -> str:
-    return _tidy(raw.rstrip(".,;:!?)]}"))
+    value = _tidy(raw.rstrip(".,;:!?)]}"))
+    return value if _keep_url(value) else ""
+
+
+def _clean_ip(raw: str) -> str:
+    match = re.fullmatch(r"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?::(\d{1,5}))?", raw)
+    if not match or any(int(group) > 255 for group in match.groups()[:4]):
+        return ""
+    port = match.group(5)
+    return raw if _port_ok(int(port) if port is not None else None) else ""
+
+
+def _clean_date(raw: str) -> str:
+    value = _tidy(raw)
+    # 无时间分量的纯日期不抽(09-23 实证 15+ 条纯日期全是文档噪声);带时分/中文时的保留。
+    return value if re.search(r"\d{1,2}:\d{2}|\d\s?时", value) else ""
 
 
 def _clean_path(raw: str) -> str:
@@ -100,8 +174,8 @@ def _clean_named_id(raw: str) -> str:
 # 顺序即优先级:先抽的类别整段占位抹除,避免 URL 里的路径、IP 里的版本号被重复抽取。
 _EXTRACTORS: Sequence[Tuple[re.Pattern, Callable[[str], str]]] = (
     (_RE_URL, _clean_url),
-    (_RE_IP, _tidy),
-    (_RE_DATE, _tidy),
+    (_RE_IP, _clean_ip),
+    (_RE_DATE, _clean_date),
     (_RE_VERSION, _tidy),
     (_RE_UUID, _tidy),
     (_RE_LONG_HEX, _tidy),
@@ -138,7 +212,8 @@ def extract_facts(text: str) -> List[str]:
             value = clean(match.group(0))
             if value:
                 facts.append(value)
-                spans.append(match.span())
+            # 被过滤的候选同样整段占位抹除:垃圾 URL/非法 IP 不泄给路径、版本号等后续抽取器。
+            spans.append(match.span())
         work = _mask_spans(work, spans)
     deduped = [fact for fact in dict.fromkeys(facts) if len(fact) <= MAX_FACT_LEN]
     return deduped[:MAX_FACTS]
@@ -286,6 +361,10 @@ def check_fidelity(
                 # fail-open: 宁回灌不误删
                 important = list(missing)
                 verdict_raw = f"{type(exc).__name__}: {exc}"[:300]
+    # 回灌预算:任何分支产出的 important 都在此截断到 MAX_AUGMENT(_judge_important 返回值
+    # 与 fail-open 的 list(missing) 同口截断),超出丢弃并记 augment_truncated。
+    augment_truncated = max(0, len(important) - MAX_AUGMENT)
+    important = important[:MAX_AUGMENT]
     record = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "session_id": session_id,
@@ -294,9 +373,11 @@ def check_fidelity(
         "missing": missing,
         "important": important,
         "augmented": bool(important),
+        "augment_truncated": augment_truncated,
         "duration_ms": int((time.monotonic() - started) * 1000),
         "model": MODEL,
         "verdict_ok": verdict_ok,
+        "verdict_raw": verdict_raw,
     }
     _write_log(record)
     return {"missing": missing, "important": important, "verdict_raw": verdict_raw}
